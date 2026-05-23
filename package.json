@@ -1,0 +1,32 @@
+{
+  "name": "pi-mcp-connector",
+  "version": "1.0.0",
+  "description": "MCP Gateway v2 for Pi — stdio/SSE/Streamable HTTP transports, session recovery, connection pooling, structured error handling.",
+  "type": "module",
+  "main": "index.ts",
+  "keywords": [
+    "pi-package",
+    "mcp"
+  ],
+  "author": "",
+  "license": "MIT",
+  "scripts": {
+    "build": "tsc",
+    "test": "tsx --test test.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.0.0",
+    "tsx": "^4.19.0"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}
