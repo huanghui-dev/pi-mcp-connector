@@ -1,7 +1,7 @@
 {
   "name": "pi-mcp-connector",
   "version": "1.0.0",
-  "description": "MCP Gateway v2 for Pi — stdio/SSE/Streamable HTTP transports, session recovery, connection pooling, structured error handling.",
+  "description": "MCP Gateway for Pi — stdio/SSE/Streamable HTTP transports, session recovery, connection pooling, structured error handling.",
   "type": "module",
   "main": "index.ts",
   "keywords": [

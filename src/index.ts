@@ -109,7 +109,7 @@ export default function mcpConnector(pi: ExtensionAPI) {
     })
     .join("\n");
 
-  const gatewayDescription = `MCP Gateway Tool v2 - Execute tools from configured servers:
+  const gatewayDescription = `MCP Gateway Tool - Execute tools from configured servers:
 ${serverNames.map(s => `- ${s}`).join(", ")}
 
 ${COLOR.bold}Currently Cached Tools Summary:${COLOR.reset}
@@ -187,7 +187,7 @@ ${toolManifest || "(No tools cached yet. Run mcp connect to sync tools.)"}`;
   // 3. Register Gateway Tool (mcp)
   (pi.registerTool as any)({
     name: "mcp",
-    label: "MCP Connector v2",
+    label: "MCP Connector",
     description: gatewayDescription,
     promptSnippet: detailedPromptSnippet,
     parameters: Type.Object({
