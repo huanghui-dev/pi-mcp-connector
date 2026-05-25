@@ -21,8 +21,39 @@ export interface TransportHooks {
 /**
  * Resolve npx binary directly from npm cache to avoid npm parent process overhead.
  */
-function resolveNpxBinary(packageSpec: string): { binPath: string; isJs: boolean } | null {
+function resolveNpxBinary(packageSpec: string, cwd?: string): { binPath: string; isJs: boolean } | null {
   try {
+    // 1. 优先尝试解析项目本地的 node_modules (如果提供了 cwd)
+    if (cwd) {
+      const localPackagePath = join(cwd, "node_modules", packageSpec);
+      if (existsSync(localPackagePath)) {
+        const pkgJsonPath = join(localPackagePath, "package.json");
+        if (existsSync(pkgJsonPath)) {
+          const pkg = JSON.parse(readFileSync(pkgJsonPath, "utf-8"));
+          const binField = pkg.bin;
+          if (binField) {
+            let binRel: string | undefined;
+            if (typeof binField === "string") {
+              binRel = binField;
+            } else if (typeof binField === "object") {
+              const baseName = packageSpec.includes("/") ? packageSpec.split("/")[1] : packageSpec;
+              binRel = binField[baseName] || Object.values(binField)[0];
+            }
+
+            if (binRel) {
+              const fullBinPath = resolve(localPackagePath, binRel);
+              if (existsSync(fullBinPath)) {
+                const isJs = fullBinPath.endsWith(".js") || fullBinPath.endsWith(".cjs") || fullBinPath.endsWith(".mjs");
+                writeLog(`[NpxResolver] Found locally installed package in node_modules: ${packageSpec} -> ${fullBinPath}`, "INFO");
+                return { binPath: fullBinPath, isJs };
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // 2. 备选方案：尝试从全局 npm 缓存 ~/.npm/_npx 中查找
     const npxCacheDir = join(homedir(), ".npm", "_npx");
     if (!existsSync(npxCacheDir)) return null;
 
@@ -251,7 +282,7 @@ export class StdioTransport {
 
     if (!packageSpec) return null;
 
-    const resolved = resolveNpxBinary(packageSpec);
+    const resolved = resolveNpxBinary(packageSpec, this.cwd);
     if (!resolved) {
       writeLog(`[${this.serverName}] npx-resolver bypassed: ${packageSpec} not found in cache, falling back to npx`, "INFO");
       return null;
