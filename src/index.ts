@@ -6,7 +6,7 @@ import { Type } from "typebox";
 import { existsSync, realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { loadMcpConfig, LOCAL_CONFIG_NAMES, isTrustedWorkspace, addTrustedWorkspace } from "./config.js";
-import { loadMetadataCache } from "./cache.js";
+import { loadMetadataCache, saveMetadataCache } from "./cache.js";
 import { McpClientPool } from "./client.js";
 import { handleMcpProxy } from "./proxy.js";
 import { writeLog } from "./logger.js";
@@ -101,6 +101,19 @@ export default function mcpConnector(pi: ExtensionAPI) {
   const cache = loadMetadataCache();
   const serverNames = Object.keys(config.mcpServers);
 
+  // Proactive self-healing cache pruning: automatically delete orphaned servers from disk cache on startup
+  let cacheDirty = false;
+  for (const cachedName of Object.keys(cache.servers)) {
+    if (!serverNames.includes(cachedName)) {
+      delete cache.servers[cachedName];
+      cacheDirty = true;
+    }
+  }
+  if (cacheDirty) {
+    saveMetadataCache(cache);
+    writeLog("Pruned orphaned server entries from metadata cache successfully.", "INFO");
+  }
+
   const cacheSummary = serverNames
     .map((name) => {
       const entry = cache.servers[name];
@@ -116,9 +129,11 @@ ${COLOR.bold}Currently Cached Tools Summary:${COLOR.reset}
 ${cacheSummary || "  (No cache available. Connect once to discover tools.)"}`;
 
   // 智能生成极其详尽的工具 Manifest 注入提示词，让模型告别盲猜，如同内置原生工具般精确调用
+  // 仅对配置中存在的服务器进行遍历，严密过滤历史/孤立的幽灵缓存条目，实现完备的边界防御
   let toolManifest = "";
-  for (const [serverName, entry] of Object.entries(cache.servers)) {
-    if (entry.tools && entry.tools.length > 0) {
+  for (const serverName of serverNames) {
+    const entry = cache.servers[serverName];
+    if (entry && entry.tools && entry.tools.length > 0) {
       toolManifest += `\n[Server: ${serverName}]\n`;
       for (const t of entry.tools) {
         const desc = cleanDescription(t.description);
