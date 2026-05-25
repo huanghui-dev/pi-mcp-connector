@@ -69,6 +69,14 @@ export class SimpleMcpClient {
   private isClosed = false;
   private inFlight = 0;
   private maxConcurrentRequests: number;
+  private requestQueue: Array<{
+    method: string;
+    params: any;
+    timeoutMs: number;
+    isRetry: boolean;
+    resolve: (val: any) => void;
+    reject: (err: Error) => void;
+  }> = [];
 
   // Stored for session recovery on 404
   private _recovering = false;
@@ -181,11 +189,27 @@ export class SimpleMcpClient {
       if (handler) {
         clearTimeout(handler.timer);
         this.pendingRequests.delete(response.id);
-        this.inFlight = Math.max(0, this.inFlight - 1);
+        this._decrementInFlight();
         if (response.error) {
           handler.reject(new Error(response.error.message || "Unknown MCP Error"));
         } else {
           handler.resolve(response.result);
+        }
+      } else if (response.method) {
+        // Defensive interception for requests sent from Server to Client (e.g. sampling/createMessage)
+        writeLog(`[${this.name}] Received bidirectional request from server: ${response.method} (id: ${response.id})`, "WARN");
+        const errorResponse = {
+          jsonrpc: "2.0",
+          id: response.id,
+          error: {
+            code: -32601,
+            message: `Method '${response.method}' not supported by client`
+          }
+        };
+        if (this.transport) {
+          this.transport.sendNotification(errorResponse).catch((err) => {
+            writeLog(`[${this.name}] Failed to send error response to server: ${err.message}`, "ERROR");
+          });
         }
       }
     }
@@ -193,6 +217,25 @@ export class SimpleMcpClient {
 
   request(method: string, params: any, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS): Promise<any> {
     return this._requestWithRetry(method, params, timeoutMs, /*isRetry*/ false);
+  }
+
+  private _decrementInFlight() {
+    this.inFlight = Math.max(0, this.inFlight - 1);
+    this._processQueue();
+  }
+
+  private _processQueue() {
+    if (this.isClosed) {
+      while (this.requestQueue.length > 0) {
+        const req = this.requestQueue.shift()!;
+        req.reject(new McpError(`MCP server "${this.name}" is closed.`, McpErrorCode.CONNECTION_FAILED));
+      }
+      return;
+    }
+    while (this.inFlight < this.maxConcurrentRequests && this.requestQueue.length > 0) {
+      const req = this.requestQueue.shift()!;
+      this._executeRequest(req.method, req.params, req.timeoutMs, req.isRetry, req.resolve, req.reject);
+    }
   }
 
   private _requestWithRetry(
@@ -206,80 +249,88 @@ export class SimpleMcpClient {
         return reject(new McpError(`MCP server "${this.name}" is closed.`, McpErrorCode.CONNECTION_FAILED));
       }
 
-      // Concurrency guard
+      // Concurrency guard: if busy, queue it instead of rejecting
       if (this.inFlight >= this.maxConcurrentRequests) {
-        return reject(new McpError(
-          `MCP server "${this.name}" has reached max concurrent requests (${this.maxConcurrentRequests}).`,
-          McpErrorCode.CONCURRENCY_LIMIT,
-        ));
+        this.requestQueue.push({ method, params, timeoutMs, isRetry, resolve, reject });
+        return;
       }
 
-      const id = ++this.requestId;
-      this.inFlight++;
+      this._executeRequest(method, params, timeoutMs, isRetry, resolve, reject);
+    });
+  }
 
-      const timer = setTimeout(() => {
+  private _executeRequest(
+    method: string,
+    params: any,
+    timeoutMs: number,
+    isRetry: boolean,
+    resolve: (val: any) => void,
+    reject: (err: Error) => void,
+  ) {
+    const id = ++this.requestId;
+    this.inFlight++;
+
+    const timer = setTimeout(() => {
+      const handler = this.pendingRequests.get(id);
+      if (handler) {
+        this.pendingRequests.delete(id);
+        this._decrementInFlight();
+        handler.reject(new McpError(
+          `Request "${method}" (id=${id}) on server "${this.name}" timed out after ${timeoutMs}ms`,
+          McpErrorCode.CONNECTION_TIMEOUT,
+        ));
+      }
+    }, timeoutMs);
+
+    this.pendingRequests.set(id, { resolve, reject, timer });
+
+    const payload = { jsonrpc: "2.0", id, method, params };
+
+    this.transport!.send(payload).then((syncResponse) => {
+      if (syncResponse) {
         const handler = this.pendingRequests.get(id);
         if (handler) {
-          this.pendingRequests.delete(id);
-          this.inFlight = Math.max(0, this.inFlight - 1);
-          handler.reject(new McpError(
-            `Request "${method}" (id=${id}) on server "${this.name}" timed out after ${timeoutMs}ms`,
-            McpErrorCode.CONNECTION_TIMEOUT,
-          ));
-        }
-      }, timeoutMs);
-
-      this.pendingRequests.set(id, { resolve, reject, timer });
-
-      const payload = { jsonrpc: "2.0", id, method, params };
-
-      this.transport.send(payload).then((syncResponse) => {
-        // If transport returned a sync response, resolve immediately
-        if (syncResponse) {
-          const handler = this.pendingRequests.get(id);
-          if (handler) {
-            clearTimeout(handler.timer);
-            this.pendingRequests.delete(id);
-            this.inFlight = Math.max(0, this.inFlight - 1);
-            if (syncResponse.error) {
-              handler.reject(new Error(syncResponse.error.message || "Unknown MCP Error"));
-            } else {
-              handler.resolve(syncResponse.result);
-            }
-          }
-        }
-      }).catch(async (err) => {
-        const handler = this.pendingRequests.get(id);
-        if (!handler) return;
-
-        const errMsg = err.message || "";
-
-        // Session expiry recovery: reconnect and retry once
-        if (!isRetry && errMsg.includes("[SESSION_EXPIRED]") && !this._recovering) {
           clearTimeout(handler.timer);
           this.pendingRequests.delete(id);
-          this.inFlight = Math.max(0, this.inFlight - 1);
-
-          try {
-            await this._recoverSession();
-            // Retry with fresh session
-            this._requestWithRetry(method, params, timeoutMs, /*isRetry*/ true)
-              .then(resolve)
-              .catch(reject);
-          } catch (recoveryErr) {
-            reject(new McpError(
-              `Session recovery failed for "${this.name}": ${recoveryErr instanceof Error ? recoveryErr.message : recoveryErr}`,
-              McpErrorCode.SESSION_EXPIRED,
-            ));
+          this._decrementInFlight();
+          if (syncResponse.error) {
+            handler.reject(new Error(syncResponse.error.message || "Unknown MCP Error"));
+          } else {
+            handler.resolve(syncResponse.result);
           }
-          return;
         }
+      }
+    }).catch(async (err) => {
+      const handler = this.pendingRequests.get(id);
+      if (!handler) return;
 
-        clearTimeout(handler.timer);
+      const errMsg = err.message || "";
+
+      // Session expiry recovery: reconnect and retry once
+      if (!isRetry && errMsg.includes("[SESSION_EXPIRED]") && !this._recovering) {
+        clearTimeout(timer);
         this.pendingRequests.delete(id);
-        this.inFlight = Math.max(0, this.inFlight - 1);
-        handler.reject(err);
-      });
+        this._decrementInFlight();
+
+        try {
+          await this._recoverSession();
+          // Retry with fresh session
+          this._requestWithRetry(method, params, timeoutMs, /*isRetry*/ true)
+            .then(resolve)
+            .catch(reject);
+        } catch (recoveryErr) {
+          reject(new McpError(
+            `Session recovery failed for "${this.name}": ${recoveryErr instanceof Error ? recoveryErr.message : recoveryErr}`,
+            McpErrorCode.SESSION_EXPIRED,
+          ));
+        }
+        return;
+      }
+
+      clearTimeout(timer);
+      this.pendingRequests.delete(id);
+      this._decrementInFlight();
+      handler.reject(err);
     });
   }
 
@@ -391,6 +442,10 @@ export class SimpleMcpClient {
     }
     this.pendingRequests.clear();
     this.inFlight = 0;
+    while (this.requestQueue.length > 0) {
+      const req = this.requestQueue.shift()!;
+      req.reject(error);
+    }
   }
 
   /**

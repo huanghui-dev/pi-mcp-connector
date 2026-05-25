@@ -185,6 +185,13 @@ export class SseTransport {
 
     if (res.status === 200) {
       const contentType = res.headers.get("content-type") ?? "";
+      const contentLengthHeader = res.headers.get("content-length");
+      if (contentLengthHeader) {
+        const length = parseInt(contentLengthHeader, 10);
+        if (Number.isFinite(length) && length > 10 * 1024 * 1024) { // 10MB safety limit
+          throw new Error("PAYLOAD_TOO_LARGE: HTTP response Content-Length exceeds the 10MB safety limit.");
+        }
+      }
       const text = await res.text();
       if (!text) return null;
 

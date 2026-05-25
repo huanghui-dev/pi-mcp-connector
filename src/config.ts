@@ -1,5 +1,5 @@
 // config.ts
-import { existsSync, readFileSync, writeFileSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, realpathSync, renameSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve, basename } from "node:path";
 import type { McpConfig, ServerDefinition, ConfigSource } from "./types.js";
@@ -141,10 +141,17 @@ export function addTrustedWorkspace(path: string) {
   const list = getTrustedWorkspaces();
   if (!list.includes(normalized)) {
     list.push(normalized);
+    const tmpPath = TRUST_FILE_PATH + "." + Math.random().toString(36).slice(2) + ".tmp";
     try {
-      writeFileSync(TRUST_FILE_PATH, JSON.stringify(list, null, 2), "utf8");
+      writeFileSync(tmpPath, JSON.stringify(list, null, 2), "utf8");
+      renameSync(tmpPath, TRUST_FILE_PATH);
     } catch (err) {
-      writeLog(`Failed to write trusted workspaces file: ${err}`, "ERROR");
+      writeLog(`Failed to write trusted workspaces file atomically: ${err}`, "ERROR");
+      try {
+        if (existsSync(tmpPath)) {
+          unlinkSync(tmpPath);
+        }
+      } catch {}
     }
   }
 }

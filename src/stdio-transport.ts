@@ -136,11 +136,16 @@ export class StdioTransport {
 
     rl.on("line", (line) => {
       if (this.isClosed) return;
+      const trimmed = line.trim();
+      if (!trimmed) return;
+      // Pre-filter: only attempt to parse standard JSON-RPC structures (starts with '{' and ends with '}')
+      // This robustly ignores warnings, random console logs, and dirty stdout streams from third-party libs
+      if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) return;
       try {
-        const response = JSON.parse(line);
+        const response = JSON.parse(trimmed);
         this.hooks?.onMessage(response);
       } catch (err) {
-        writeLog(`[${this.serverName}] Failed to parse stdout line: ${line}. Error: ${err}`, "ERROR");
+        writeLog(`[${this.serverName}] Failed to parse stdout line: ${trimmed}. Error: ${err}`, "ERROR");
       }
     });
 
@@ -150,7 +155,8 @@ export class StdioTransport {
       terminal: false,
     });
     stderrRl.on("line", (line) => {
-      const safeLine = line.length > 300 ? line.substring(0, 297) + "..." : line;
+      // Memory protection limit: truncate ultra-long lines immediately to prevent potential OOM from rogue logs
+      const safeLine = line.length > 500 ? line.substring(0, 497) + "..." : line;
       writeLog(`[${this.serverName} stderr] ${safeLine}`, "INFO");
       if (this.debug) {
         writeLog(`[${this.serverName} debug] ${safeLine}`, "INFO");

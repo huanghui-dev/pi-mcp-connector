@@ -425,20 +425,138 @@ test("SimpleMcpClient - concurrency limit rejection", async () => {
 
   await client.connect();
 
+  let p1Completed = false;
+  let p2Completed = false;
+
   // First call fills the only slot (server holds the response)
-  const p1 = client.callTool("hang", {}).catch(() => {});
+  const p1 = client.callTool("hang", {}).then(() => { p1Completed = true; });
   // Give time for the request to be dispatched
   await new Promise(r => setTimeout(r, 200));
 
-  // Second call should be rejected due to concurrency limit
-  await assert.rejects(
-    () => client.callTool("hang", {}),
-    (err: any) => err.message.includes("max concurrent requests"),
-  );
+  // Second call should be queued instead of rejected (FIFO queueing)
+  const p2 = client.callTool("hang", {}).then(() => { p2Completed = true; });
+  await new Promise(r => setTimeout(r, 200));
 
-  // Release the first response and clean up
+  // Assert that neither is completed yet because p1 is hung and p2 is queued
+  assert.strictEqual(p1Completed, false);
+  assert.strictEqual(p2Completed, false);
+
+  // Release the first response
   releaseResponse?.();
-  await p1;
+
+  // Wait for both to finish
+  await Promise.all([p1, p2]);
+
+  // Assert that both successfully finished (due to queueing)
+  assert.strictEqual(p1Completed, true);
+  assert.strictEqual(p2Completed, true);
+
   await client.close();
   await new Promise<void>((resolve) => server.close(() => resolve()));
+});
+
+test("StdioTransport - NDJSON Garbage Filtering", async () => {
+  const { writeFileSync, unlinkSync } = await import("node:fs");
+  const tempServerPath = join(import.meta.dirname, "temp-garbage-server.js");
+
+  // Write a server script that outputs a garbage warning line first, then behaves normally
+  const serverCode = `
+    import readline from "node:readline";
+    console.log("Warning: Debugger attached."); // Garbage non-JSON line
+    console.log(" "); // Empty line
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: false });
+    rl.on("line", (line) => {
+      const req = JSON.parse(line);
+      if (req.method === "initialize") {
+        console.log(JSON.stringify({
+          jsonrpc: "2.0",
+          id: req.id,
+          result: { protocolVersion: "2024-11-05", capabilities: {}, serverInfo: { name: "garbage-mock", version: "1.0.0" } }
+        }));
+      } else if (req.method === "notifications/initialized") {
+        // handshake done
+      } else if (req.method === "tools/list") {
+        console.log(JSON.stringify({
+          jsonrpc: "2.0",
+          id: req.id,
+          result: { tools: [] }
+        }));
+      }
+    });
+  `;
+  writeFileSync(tempServerPath, serverCode, "utf8");
+
+  const client = new SimpleMcpClient("garbage-test-server", "node", [tempServerPath]);
+
+  try {
+    const initResult = await client.connect();
+    assert.ok(initResult);
+    assert.strictEqual(initResult.serverInfo.name, "garbage-mock");
+
+    const tools = await client.listTools();
+    assert.strictEqual(tools.length, 0);
+  } finally {
+    await client.close();
+    try { unlinkSync(tempServerPath); } catch {}
+  }
+});
+
+test("SimpleMcpClient - Bidirectional Server Request Interception", async () => {
+  const { writeFileSync, unlinkSync, existsSync, readFileSync } = await import("node:fs");
+  const tempServerPath = join(import.meta.dirname, "temp-bidir-server.js");
+  const replyFilePath = join(import.meta.dirname, "bidir-reply.json");
+
+  try { if (existsSync(replyFilePath)) unlinkSync(replyFilePath); } catch {}
+
+  const serverCode = `
+    import readline from "node:readline";
+    import fs from "node:fs";
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: false });
+    rl.on("line", (line) => {
+      const req = JSON.parse(line);
+      if (req.method === "initialize") {
+        console.log(JSON.stringify({
+          jsonrpc: "2.0",
+          id: req.id,
+          result: { protocolVersion: "2024-11-05", capabilities: {}, serverInfo: { name: "bidir-mock", version: "1.0.0" } }
+        }));
+      } else if (req.method === "notifications/initialized") {
+        // Handshake done, trigger a request from Server to Client
+        console.log(JSON.stringify({
+          jsonrpc: "2.0",
+          id: 999,
+          method: "sampling/createMessage",
+          params: { messages: [] }
+        }));
+      } else if (req.id === 999) {
+        fs.writeFileSync("${replyFilePath.replace(/\\/g, "\\\\")}", JSON.stringify(req), "utf8");
+      }
+    });
+  `;
+  writeFileSync(tempServerPath, serverCode, "utf8");
+
+  const client = new SimpleMcpClient("bidir-test-server", "node", [tempServerPath]);
+
+  try {
+    await client.connect();
+    // Wait for the bidirectional request/response roundtrip to complete
+    for (let i = 0; i < 50; i++) {
+      if (existsSync(replyFilePath)) break;
+      await new Promise(r => setTimeout(r, 50));
+    }
+
+    assert.ok(existsSync(replyFilePath));
+    const replyRaw = readFileSync(replyFilePath, "utf8");
+    const reply = JSON.parse(replyRaw);
+
+    assert.strictEqual(reply.jsonrpc, "2.0");
+    assert.strictEqual(reply.id, 999);
+    assert.ok(reply.error);
+    assert.strictEqual(reply.error.code, -32601);
+    assert.ok(reply.error.message.includes("not supported"));
+  } finally {
+    await client.close();
+    try { unlinkSync(tempServerPath); } catch {}
+    try { if (existsSync(replyFilePath)) unlinkSync(replyFilePath); } catch {}
+  }
 });
